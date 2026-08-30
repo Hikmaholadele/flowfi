@@ -13,6 +13,7 @@ import {
   resumeStream as sorobanResumeStream,
 } from "../services/sorobanService.js";
 import type { AuthenticatedRequest } from "../types/auth.types.js";
+import { parseStreamId } from "../lib/stream-id.js";
 import {
   DEFAULT_EVENTS_PAGE_SIZE,
   MAX_EVENTS_PAGE_SIZE,
@@ -20,6 +21,15 @@ import {
 
 const DEFAULT_STREAM_PAGE_SIZE = 20;
 const MAX_STREAM_PAGE_SIZE = 100;
+
+/**
+ * Hard cap on the number of streams fetched per user in the summary endpoint.
+ * Prevents unbounded DB queries when a wallet has thousands of streams.
+ * Users who exceed this cap receive a truncated summary (counts and totals
+ * reflect only the most recent streams) plus a `truncated` flag so the
+ * frontend can offer a pagination or export fallback.
+ */
+export const MAX_USER_STREAMS = 500;
 
 interface UserStreamSummary {
   address: string;
@@ -128,10 +138,10 @@ export const createStream = async (req: Request, res: Response) => {
       });
     }
 
-    const parsedStreamId = Number.parseInt(streamId, 10);
+    const parsedStreamId = parseStreamId(streamId);
     const parsedStartTime = Number.parseInt(startTime, 10);
 
-    if (!Number.isFinite(parsedStreamId)) {
+    if (parsedStreamId === null) {
       return res
         .status(400)
         .json({ error: "Invalid streamId: must be a valid integer" });
@@ -211,7 +221,7 @@ export const createStream = async (req: Request, res: Response) => {
       },
     });
 
-    return res.status(201).json(stream);
+    return res.status(201).json(JSON.parse(JSON.stringify(stream, (_key, value) => typeof value === "bigint" ? value.toString() : value)));
   } catch (error) {
     if (
       error instanceof RangeError ||
@@ -347,9 +357,8 @@ export const getStream = async (req: Request, res: Response) => {
     const streamIdParam = Array.isArray(req.params.streamId)
       ? req.params.streamId[0]
       : req.params.streamId;
-    const parsedStreamId = Number.parseInt(streamIdParam ?? "", 10);
-
-    if (!Number.isFinite(parsedStreamId)) {
+    const parsedStreamId = parseStreamId(streamIdParam);
+    if (parsedStreamId === null) {
       return res.status(400).json({ error: "Invalid streamId parameter" });
     }
 
@@ -398,9 +407,8 @@ export const getStreamEvents = async (req: Request, res: Response) => {
     const streamIdParam = Array.isArray(req.params.streamId)
       ? req.params.streamId[0]
       : req.params.streamId;
-    const parsedStreamId = Number.parseInt(streamIdParam ?? "", 10);
-
-    if (!Number.isFinite(parsedStreamId)) {
+    const parsedStreamId = parseStreamId(streamIdParam);
+    if (parsedStreamId === null) {
       return res.status(400).json({ error: "Invalid streamId parameter" });
     }
 
@@ -489,9 +497,8 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
     const streamIdParam = Array.isArray(req.params.streamId)
       ? req.params.streamId[0]
       : req.params.streamId;
-    const parsedStreamId = Number.parseInt(streamIdParam ?? "", 10);
-
-    if (!Number.isFinite(parsedStreamId)) {
+    const parsedStreamId = parseStreamId(streamIdParam);
+    if (parsedStreamId === null) {
       return res.status(400).json({ error: "Invalid streamId parameter" });
     }
 
@@ -592,9 +599,15 @@ export const getUserStreamSummary = async (
 
     pruneUserSummaryCache(nowMs);
 
+    // Issue #1246: cap the number of streams fetched per direction to prevent
+    // unbounded DB queries.  Power users with more than MAX_USER_STREAMS
+    // streams receive a truncated summary (the `truncated` flag lets the
+    // frontend offer a pagination/export fallback).
     const [outgoingStreams, incomingStreams] = await Promise.all([
       prisma.stream.findMany({
         where: { sender: address },
+        orderBy: { startTime: "desc" },
+        take: MAX_USER_STREAMS,
         select: {
           streamId: true,
           ratePerSecond: true,
@@ -611,6 +624,8 @@ export const getUserStreamSummary = async (
       }),
       prisma.stream.findMany({
         where: { recipient: address },
+        orderBy: { startTime: "desc" },
+        take: MAX_USER_STREAMS,
         select: {
           streamId: true,
           ratePerSecond: true,
@@ -653,7 +668,11 @@ export const getUserStreamSummary = async (
       (stream: any) => stream.isActive,
     ).length;
 
-    const summary: UserStreamSummary = {
+    const truncated =
+      outgoingStreams.length >= MAX_USER_STREAMS ||
+      incomingStreams.length >= MAX_USER_STREAMS;
+
+    const summary = {
       address,
       totalStreamsCreated,
       totalStreamedOut,
@@ -661,7 +680,8 @@ export const getUserStreamSummary = async (
       currentClaimable: claimableInTotal.toString(),
       activeOutgoingCount,
       activeIncomingCount,
-    };
+      ...(truncated ? { truncated: true } : {}),
+    } satisfies UserStreamSummary & { truncated?: boolean };
 
     userSummaryCache.set(cacheKey, {
       value: summary,
@@ -686,13 +706,12 @@ const topUpBodySchema = z.object({
  * Adds tokens to a running stream. Only the stream sender may call this.
  */
 export const topUpStreamHandler = async (req: Request, res: Response) => {
-  const streamId = parseInt(
+  const streamId = parseStreamId(
     Array.isArray(req.params.streamId)
-      ? req.params.streamId[0]!
-      : (req.params.streamId ?? ""),
-    10,
+      ? req.params.streamId[0]
+      : req.params.streamId,
   );
-  if (isNaN(streamId)) {
+  if (streamId === null) {
     return res.status(400).json({ error: "Invalid streamId" });
   }
 
@@ -769,9 +788,8 @@ export const pauseStream = async (req: Request, res: Response) => {
     const streamIdParam = Array.isArray(req.params.streamId)
       ? req.params.streamId[0]
       : req.params.streamId;
-    const parsedStreamId = Number.parseInt(streamIdParam ?? "", 10);
-
-    if (!Number.isFinite(parsedStreamId)) {
+    const parsedStreamId = parseStreamId(streamIdParam);
+    if (parsedStreamId === null) {
       return res.status(400).json({ error: "Invalid streamId parameter" });
     }
 
@@ -861,9 +879,8 @@ export const resumeStream = async (req: Request, res: Response) => {
     const streamIdParam = Array.isArray(req.params.streamId)
       ? req.params.streamId[0]
       : req.params.streamId;
-    const parsedStreamId = Number.parseInt(streamIdParam ?? "", 10);
-
-    if (!Number.isFinite(parsedStreamId)) {
+    const parsedStreamId = parseStreamId(streamIdParam);
+    if (parsedStreamId === null) {
       return res.status(400).json({ error: "Invalid streamId parameter" });
     }
 
